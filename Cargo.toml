@@ -1,7 +1,13 @@
 [package]
 name = "seckoo"
-version = "0.1.0"
+version = "0.0.0-alpha0.1"
 edition = "2021"
+license = "MIT"
+description = "A concurrent Single-Writer-Multi-Reader Cuckoo Map"
+homepage = "https://docs.rs/seckoo"
+documentation = "https://docs.rs/seckoo"
+repository = "https://github.com/emilHof/seckoo"
+readme = "./README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
