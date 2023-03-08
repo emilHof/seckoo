@@ -26,6 +26,15 @@ This crate and its API is thus still quite unstable and should be used with **ca
   - [ ] `get_or_insert(&self, key: K, f: impl FnOnce() -> V) -> Entry<'c, K, V, ...>;`
   - [ ] `get_cloned(&self, key: &K) -> Option<V> where V: Clone;`
   - [ ] `contains(&self, key: &K) -> bool;`
+- [ ] Insertion/removal scheme:
+  - [ ] How do we handle insertions when max capacity is reached?
+    - [ ] Option (1): Have a recursion depth counter, that eventually just inserts the new item and does not attempt to re-insert the old item.
+    - [ ] Option (2): We prevent insertion after the array is filled up by some fraction.
+- [ ] Hashing/How many Hashers?
+  - How many hashers should we have?
+  - Option (1): Use `const` generics to give users ability to choose.
+  - Option (2): Use a fixed amount, maybe 2?
+    - If we take advantage of this we can use one `Hasher` for the first index and the second `Hasher` to create a tag. We can then tag our pointers to make comparison easier, and use the tag `XOR`'d with the first hash to get the second index.
 - [ ] Improve code coverage
 - [ ] Add fuzzing
 - [ ] Add benches
