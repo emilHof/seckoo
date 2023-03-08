@@ -80,7 +80,7 @@ impl<K, V, const M: usize, const N: usize, const B: usize>
 impl<K, V, H: std::hash::Hasher, const M: usize, const N: usize, const B: usize>
     CuckooHash<K, V, H, M, N, B>
 {
-    fn try_lock(&self) -> Result<WriteGuard<K, V, H, M, N, B>, ()> {
+    pub fn try_lock(&self) -> Result<WriteGuard<K, V, H, M, N, B>, ()> {
         if !self.locked.swap(true, atomic::Ordering::Acquire) {
             return Ok(WriteGuard { cuckoo: self });
         };
@@ -151,6 +151,15 @@ where
                 if bucket.is_empty() {
                     bucket.start_write();
                     unsafe { std::ptr::write_volatile(&bucket.key as *const K as *mut _, k) }
+                    unsafe { std::ptr::write_volatile(&bucket.val as *const V as *mut _, v) }
+                    bucket.end_write();
+
+                    return;
+                }
+
+                // If the key is the same, we insert the new value.
+                if k.eq(&bucket.key) {
+                    bucket.start_write();
                     unsafe { std::ptr::write_volatile(&bucket.val as *const V as *mut _, v) }
                     bucket.end_write();
 
