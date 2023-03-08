@@ -15,6 +15,7 @@ This crate and its API is thus still quite unstable and should be used with **ca
 - [ ] Vital
   - [ ] `insert` currently allows for multiple equal keys to exist in the table at the same time. Fix this!
     - Does it actually? If we search for a key, an empty bucket should mean that it is not in the list, as a keys should always try to insert themselves as early as possible. Once we allow for removing elements, then this will be a concern!
+ - [ ] Changing bucket group items to `*mut Bucket<K, V>` would reduce the minimum allocation size, as the bucket array/`Vec` would be smaller.
 - [ ] Upgrade from SeqLock to a Pointer setup.
   - [ ] Change `Bucket<K, V>` to `AtomicPointer<Bucket<K, V>>`
   - [ ] Add garbage collection ([`crossbeam_epoch::Epoch`](https://crates.io/crates/crossbeam-epoch)).
