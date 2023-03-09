@@ -22,6 +22,21 @@ pub struct CuckooHash<K, V, H, const M: usize, const N: usize, const B: usize> {
     collector: Collector,
 }
 
+unsafe impl<K, V, H, const M: usize, const N: usize, const B: usize> Send
+    for CuckooHash<K, V, H, M, N, B>
+where
+    K: Send,
+    V: Send,
+{
+}
+
+unsafe impl<K, V, H, const M: usize, const N: usize, const B: usize> Sync
+    for CuckooHash<K, V, H, M, N, B>
+where
+    K: Sync,
+    V: Sync,
+{
+}
 #[derive(Debug)]
 struct Bucket<K, V> {
     key: K,
