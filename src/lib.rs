@@ -20,7 +20,6 @@ pub struct CuckooHash<K, V, H, const M: usize, const N: usize, const B: usize> {
     hashers: [H; N],
     buckets: [[Atomic<Bucket<K, V>>; B]; M],
     collector: Collector,
-    locked: atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -40,27 +39,14 @@ impl<K, V, const M: usize, const N: usize, const B: usize>
             hashers: [(); N].map(|_| std::collections::hash_map::RandomState::new().build_hasher()),
             buckets,
             collector: Collector::new(),
-            locked: atomic::AtomicBool::new(false),
         }
-    }
-}
-
-impl<K, V, H: std::hash::Hasher, const M: usize, const N: usize, const B: usize>
-    CuckooHash<K, V, H, M, N, B>
-{
-    pub fn try_lock(&self) -> Result<WriteGuard<K, V, H, M, N, B>, ()> {
-        if !self.locked.swap(true, atomic::Ordering::Acquire) {
-            return Ok(WriteGuard { cuckoo: self });
-        };
-
-        Err(())
     }
 }
 
 impl<K, V, H, const M: usize, const N: usize, const B: usize> CuckooHash<K, V, H, M, N, B>
 where
     H: std::hash::Hasher + Clone,
-    K: Clone + std::hash::Hash + std::cmp::Eq,
+    K: std::hash::Hash + std::cmp::Eq,
     V: Clone,
 {
     pub fn get(&self, k: &K) -> Option<V> {
@@ -102,20 +88,9 @@ where
 
         None
     }
-}
 
-pub struct WriteGuard<'c, K, V, H, const M: usize, const N: usize, const B: usize> {
-    cuckoo: &'c CuckooHash<K, V, H, M, N, B>,
-}
-
-impl<'c, K, V, H, const M: usize, const N: usize, const B: usize> WriteGuard<'c, K, V, H, M, N, B>
-where
-    H: std::hash::Hasher + Clone,
-    K: std::hash::Hash + std::cmp::Eq,
-    V: Clone,
-{
     pub fn insert(&self, k: K, v: V) {
-        let handle = self.cuckoo.collector.register();
+        let handle = self.collector.register();
         let guard = handle.pin();
         let new_bucket = Owned::from(Bucket { key: k, val: v }).into_shared(&guard);
 
@@ -124,20 +99,20 @@ where
 
     fn insert_internal(&self, new_bucket: Shared<Bucket<K, V>>, guard: &Guard, depth: usize) {
         // If retry depth is exceeded, defer deallocation of the current bucket and return.
-        if depth >= B {
+        if depth >= 8 {
             unsafe {
                 guard.defer_destroy(new_bucket);
             }
             return;
         }
 
-        for hasher in &self.cuckoo.hashers {
+        for hasher in &self.hashers {
             let mut hasher = hasher.clone();
             unsafe {
                 new_bucket.deref().key.hash(&mut hasher);
             }
             let hash = hasher.finish() as usize;
-            for bucket in self.cuckoo.buckets[hash % M].iter() {
+            for bucket in self.buckets[hash % M].iter() {
                 // If an empty bucket is found, we insert here.
                 loop {
                     // Try inserting expecting a null.
@@ -179,24 +154,81 @@ where
 
         // No empty location was found, so we insert it in our first choice bucket and re-insert
         // the old value.
-        let mut hasher = self.cuckoo.hashers[0].clone();
+        let mut hasher = self.hashers[0].clone();
         unsafe {
             new_bucket.deref().key.hash(&mut hasher);
         }
         let hash = hasher.finish() as usize;
-        let bucket = &self.cuckoo.buckets[hash % M][B - 1 - depth];
+        let bucket = &self.buckets[hash % M][B - (depth % B) - 1];
 
         let old = bucket.swap(new_bucket, atomic::Ordering::Relaxed, &guard);
 
         self.insert_internal(old, guard, depth + 1);
     }
+
+    pub fn iter(&self) -> Iter<'_, K, V, H, M, N, B> {
+        Iter {
+            cuckoo: &self,
+            index: 0,
+        }
+    }
 }
 
-impl<'c, K, V, H, const M: usize, const N: usize, const B: usize> Drop
-    for WriteGuard<'c, K, V, H, M, N, B>
+pub struct Iter<'c, K, V, H, const M: usize, const N: usize, const B: usize> {
+    cuckoo: &'c CuckooHash<K, V, H, M, N, B>,
+    index: usize,
+}
+
+impl<'a, K, V, H, const M: usize, const N: usize, const B: usize> Iterator
+    for Iter<'a, K, V, H, M, N, B>
+where
+    H: std::hash::Hasher + Clone,
+    K: std::hash::Hash + std::cmp::Eq,
+    V: Clone,
 {
-    fn drop(&mut self) {
-        self.cuckoo.locked.store(false, atomic::Ordering::Release)
+    type Item = V;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let handle = self.cuckoo.collector.register();
+        let guard = handle.pin();
+
+        while self.index < M * B
+            && self.cuckoo.buckets[self.index / B][self.index % B]
+                .load(atomic::Ordering::Relaxed, &guard)
+                .is_null()
+        {
+            self.index += 1
+        }
+
+        if self.index >= M * B {
+            return None;
+        }
+
+        unsafe {
+            self.index += 1;
+            return Some(
+                self.cuckoo.buckets[(self.index - 1) / B][(self.index - 1) % B]
+                    .load(atomic::Ordering::Relaxed, &guard)
+                    .deref()
+                    .val
+                    .clone(),
+            );
+        }
+    }
+}
+
+impl<'a, K, V, H, const M: usize, const N: usize, const B: usize> IntoIterator
+    for &'a CuckooHash<K, V, H, M, N, B>
+where
+    H: std::hash::Hasher + Clone,
+    K: std::hash::Hash + std::cmp::Eq,
+    V: Clone,
+{
+    type Item = V;
+    type IntoIter = Iter<'a, K, V, H, M, N, B>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -210,23 +242,10 @@ mod test {
     }
 
     #[test]
-    fn test_lock() {
-        let hashmap = HashMap::<i32, i32>::std();
-
-        let lock = hashmap.try_lock();
-
-        assert!(lock.is_ok());
-
-        assert!(hashmap.try_lock().is_err());
-    }
-
-    #[test]
     fn test_insert_get() {
         let hashmap = HashMap::<String, ()>::std();
 
-        let lock = hashmap.try_lock().unwrap();
-
-        lock.insert("Hello There!".to_string(), ());
+        hashmap.insert("Hello There!".to_string(), ());
 
         assert!(hashmap.get(&"Hello There!".to_string()).is_some());
     }
@@ -235,10 +254,8 @@ mod test {
     fn test_insert_updates_equal_key() {
         let hashmap = HashMap::<String, i32>::std();
 
-        let lock = hashmap.try_lock().unwrap();
-
-        lock.insert("Hello There!".to_string(), 0);
-        lock.insert("Hello There!".to_string(), 1);
+        hashmap.insert("Hello There!".to_string(), 0);
+        hashmap.insert("Hello There!".to_string(), 1);
 
         assert!(hashmap.get(&"Hello There!".to_string()).is_some());
         assert_eq!(1, hashmap.get(&"Hello There!".to_string()).unwrap());
@@ -248,16 +265,51 @@ mod test {
     fn stops_retrying_on_max_depth() {
         let hashmap = HashMap::<String, i32, _, 4, 2, 1>::std();
 
-        let lock = hashmap.try_lock().unwrap();
-
-        lock.insert("1".to_string(), 0);
-        lock.insert("2".to_string(), 1);
-        lock.insert("3".to_string(), 2);
-        lock.insert("4".to_string(), 3);
+        hashmap.insert("1".to_string(), 0);
+        hashmap.insert("2".to_string(), 1);
+        hashmap.insert("3".to_string(), 2);
+        hashmap.insert("4".to_string(), 3);
 
         println!("{}", hashmap.get(&"1".to_string()).is_some());
         println!("{}", hashmap.get(&"2".to_string()).is_some());
         println!("{}", hashmap.get(&"3".to_string()).is_some());
         println!("{}", hashmap.get(&"4".to_string()).is_some());
+    }
+
+    #[test]
+    fn test_iter() {
+        let hashmap = HashMap::<String, i32>::std();
+
+        hashmap.insert("1".to_string(), 0);
+        hashmap.insert("2".to_string(), 1);
+        hashmap.insert("3".to_string(), 2);
+        hashmap.insert("4".to_string(), 3);
+
+        for value in &hashmap {
+            println!("{value}")
+        }
+    }
+
+    #[test]
+    fn test_threads() {
+        use std::thread;
+
+        let hashmap = HashMap::<[u8; 12], [u8; 12], _, 64, 2, 2>::std();
+
+        thread::scope(|s| {
+            let hashmap = &hashmap;
+
+            for _ in 0..8 {
+                s.spawn(move || {
+                    for _ in 0..16 {
+                        hashmap.insert(rand::random(), rand::random());
+                    }
+                });
+            }
+        });
+
+        for value in &hashmap {
+            println!("{}", String::from_utf8_lossy(&value));
+        }
     }
 }
