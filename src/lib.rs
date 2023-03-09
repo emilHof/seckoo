@@ -1,6 +1,5 @@
+use crossbeam_epoch::{Atomic, Collector, CompareExchangeError, Guard, LocalHandle, Owned, Shared};
 use std::hash::BuildHasher;
-use std::mem::MaybeUninit;
-use std::ptr::write_bytes;
 use std::sync::atomic;
 
 const DEFAULT_LENGTH: usize = 1024;
@@ -19,7 +18,8 @@ pub type HashMap<
 #[derive(Debug)]
 pub struct CuckooHash<K, V, H, const M: usize, const N: usize, const B: usize> {
     hashers: [H; N],
-    buckets: [[Bucket<K, V>; B]; M],
+    buckets: [[Atomic<Bucket<K, V>>; B]; M],
+    collector: Collector,
     locked: atomic::AtomicBool,
 }
 
@@ -27,26 +27,6 @@ pub struct CuckooHash<K, V, H, const M: usize, const N: usize, const B: usize> {
 struct Bucket<K, V> {
     key: K,
     val: V,
-    version: atomic::AtomicUsize,
-}
-
-impl<K, V> Bucket<K, V> {
-    fn is_empty(&self) -> bool {
-        self.version.load(atomic::Ordering::Acquire) == 0
-    }
-    /// Increments the sequence at the current index by 1, making it odd, prohibiting reads.
-    #[inline]
-    fn start_write(&self) {
-        let version = self.version.fetch_add(1, atomic::Ordering::Relaxed);
-        assert!(version & 1 == 0);
-    }
-
-    /// Increments the sequence at the current index by 1, making it even and allowing reads.
-    #[inline]
-    fn end_write(&self) {
-        let version = self.version.fetch_add(1, atomic::Ordering::Relaxed);
-        assert!(version & 1 == 1);
-    }
 }
 
 impl<K, V, const M: usize, const N: usize, const B: usize>
@@ -54,24 +34,12 @@ impl<K, V, const M: usize, const N: usize, const B: usize>
 {
     // #[cfg(feature = "nightly")]
     pub fn std() -> Self {
-        let buckets: [[Bucket<K, V>; B]; M] = unsafe {
-            let mut buckets: [[MaybeUninit<Bucket<K, V>>; B]; M] =
-                MaybeUninit::uninit().assume_init();
-            write_bytes(&mut buckets, 0, 1);
-
-            // This workaround is currently necessary, as `core::mem::transmute()` is not available
-            // for arrays whose length is specified by Const Generics.
-            let init = core::ptr::read(
-                (&buckets as *const [[MaybeUninit<Bucket<K, V>>; B]; M])
-                    .cast::<[[Bucket<K, V>; B]; M]>(),
-            );
-            core::mem::forget(buckets);
-            init
-        };
+        let buckets = [(); M].map(|_| [(); B].map(|_| Atomic::<Bucket<K, V>>::null()));
 
         CuckooHash {
             hashers: [(); N].map(|_| std::collections::hash_map::RandomState::new().build_hasher()),
             buckets,
+            collector: Collector::new(),
             locked: atomic::AtomicBool::new(false),
         }
     }
@@ -92,15 +60,17 @@ impl<K, V, H: std::hash::Hasher, const M: usize, const N: usize, const B: usize>
 impl<K, V, H, const M: usize, const N: usize, const B: usize> CuckooHash<K, V, H, M, N, B>
 where
     H: std::hash::Hasher + Clone,
-    K: Copy + std::hash::Hash + std::cmp::Eq,
-    V: Copy,
+    K: Clone + std::hash::Hash + std::cmp::Eq,
+    V: Clone,
 {
     pub fn get(&self, k: &K) -> Option<V> {
+        let handle = self.collector.register();
+
         for hasher in &self.hashers {
             let mut hasher = hasher.clone();
             k.hash(&mut hasher);
             let hash = hasher.finish() as usize;
-            if let Some(val) = self.search_buckets(hash % M, k) {
+            if let Some(val) = self.search_buckets(hash % M, k, &handle) {
                 return Some(val);
             }
         }
@@ -109,20 +79,23 @@ where
 
     // Searches a bucket for a key. Rereads when version after read is wrong, yet does not re-read
     // prior buckets.
-    fn search_buckets(&self, i: usize, k: &K) -> Option<V> {
-        for bucket in &self.buckets[i] {
-            loop {
-                let v1 = bucket.version.load(atomic::Ordering::Acquire);
-                let t_k = unsafe { std::ptr::read_volatile(&bucket.key as *const K as *mut K) };
-                let v = unsafe { std::ptr::read_volatile(&bucket.val as *const V as *mut V) };
-                let v2 = bucket.version.load(atomic::Ordering::Relaxed);
+    fn search_buckets<'a>(&'a self, i: usize, k: &K, handle: &LocalHandle) -> Option<V>
+    where
+        V: Clone,
+    {
+        for bucket_ptr in &self.buckets[i] {
+            let guard = handle.pin();
+            guard.flush();
 
-                if v1 != v2 {
-                    continue;
+            let bucket = bucket_ptr.load(atomic::Ordering::Relaxed, &guard);
+            unsafe {
+                // If we have an empty bucket, then the key is not in the map.
+                if bucket.is_null() {
+                    return None;
                 }
 
-                if k.eq(&t_k) {
-                    return Some(v);
+                if bucket.deref().key.eq(&k) {
+                    return Some(bucket.deref().val.clone());
                 }
             }
         }
@@ -138,52 +111,84 @@ pub struct WriteGuard<'c, K, V, H, const M: usize, const N: usize, const B: usiz
 impl<'c, K, V, H, const M: usize, const N: usize, const B: usize> WriteGuard<'c, K, V, H, M, N, B>
 where
     H: std::hash::Hasher + Clone,
-    K: Copy + std::hash::Hash + std::cmp::Eq,
-    V: Copy,
+    K: std::hash::Hash + std::cmp::Eq,
+    V: Clone,
 {
     pub fn insert(&self, k: K, v: V) {
+        let handle = self.cuckoo.collector.register();
+        let guard = handle.pin();
+        let new_bucket = Owned::from(Bucket { key: k, val: v }).into_shared(&guard);
+
+        self.insert_internal(new_bucket, &guard, 0);
+    }
+
+    fn insert_internal(&self, new_bucket: Shared<Bucket<K, V>>, guard: &Guard, depth: usize) {
+        // If retry depth is exceeded, defer deallocation of the current bucket and return.
+        if depth >= B {
+            unsafe {
+                guard.defer_destroy(new_bucket);
+            }
+            return;
+        }
+
         for hasher in &self.cuckoo.hashers {
             let mut hasher = hasher.clone();
-            k.hash(&mut hasher);
+            unsafe {
+                new_bucket.deref().key.hash(&mut hasher);
+            }
             let hash = hasher.finish() as usize;
             for bucket in self.cuckoo.buckets[hash % M].iter() {
                 // If an empty bucket is found, we insert here.
-                if bucket.is_empty() {
-                    bucket.start_write();
-                    unsafe { std::ptr::write_volatile(&bucket.key as *const K as *mut _, k) }
-                    unsafe { std::ptr::write_volatile(&bucket.val as *const V as *mut _, v) }
-                    bucket.end_write();
+                loop {
+                    // Try inserting expecting a null.
+                    let Err( CompareExchangeError { current, new: _ } ) = bucket.compare_exchange(
+                        Shared::null(),
+                        new_bucket,
+                        atomic::Ordering::Relaxed,
+                        atomic::Ordering::Relaxed,
+                        &guard,
+                    ) else {
+                        return;
+                    };
 
-                    return;
-                }
+                    unsafe {
+                        if current.deref().key.ne(&new_bucket.deref().key) {
+                            break;
+                        }
+                    }
 
-                // If the key is the same, we insert the new value.
-                if k.eq(&bucket.key) {
-                    bucket.start_write();
-                    unsafe { std::ptr::write_volatile(&bucket.val as *const V as *mut _, v) }
-                    bucket.end_write();
+                    // If keys are equal, try inserting a new value.
+                    let Err( CompareExchangeError { current, new: _ } ) = bucket.compare_exchange(
+                        current,
+                        new_bucket,
+                        atomic::Ordering::Relaxed,
+                        atomic::Ordering::Relaxed,
+                        &guard,
+                    ) else {
+                        return;
+                    };
 
-                    return;
+                    unsafe {
+                        if current.deref().key.ne(&new_bucket.deref().key) {
+                            break;
+                        }
+                    }
                 }
             }
         }
 
         // No empty location was found, so we insert it in our first choice bucket and re-insert
         // the old value.
-        //
         let mut hasher = self.cuckoo.hashers[0].clone();
-        k.hash(&mut hasher);
+        unsafe {
+            new_bucket.deref().key.hash(&mut hasher);
+        }
         let hash = hasher.finish() as usize;
-        let bucket = &self.cuckoo.buckets[hash % M][0];
-        let old_key = bucket.key;
-        let old_val = bucket.val;
+        let bucket = &self.cuckoo.buckets[hash % M][B - 1 - depth];
 
-        bucket.start_write();
-        unsafe { std::ptr::write_volatile(&bucket.key as *const K as *mut _, k) }
-        unsafe { std::ptr::write_volatile(&bucket.val as *const V as *mut _, v) }
-        bucket.start_write();
+        let old = bucket.swap(new_bucket, atomic::Ordering::Relaxed, &guard);
 
-        self.insert(old_key, old_val);
+        self.insert_internal(old, guard, depth + 1);
     }
 }
 
@@ -217,12 +222,42 @@ mod test {
 
     #[test]
     fn test_insert_get() {
-        let hashmap = HashMap::<[u8; 12], ()>::std();
+        let hashmap = HashMap::<String, ()>::std();
 
         let lock = hashmap.try_lock().unwrap();
 
-        lock.insert(*b"Hello There!", ());
+        lock.insert("Hello There!".to_string(), ());
 
-        assert!(hashmap.get(b"Hello There!").is_some());
+        assert!(hashmap.get(&"Hello There!".to_string()).is_some());
+    }
+
+    #[test]
+    fn test_insert_updates_equal_key() {
+        let hashmap = HashMap::<String, i32>::std();
+
+        let lock = hashmap.try_lock().unwrap();
+
+        lock.insert("Hello There!".to_string(), 0);
+        lock.insert("Hello There!".to_string(), 1);
+
+        assert!(hashmap.get(&"Hello There!".to_string()).is_some());
+        assert_eq!(1, hashmap.get(&"Hello There!".to_string()).unwrap());
+    }
+
+    #[test]
+    fn stops_retrying_on_max_depth() {
+        let hashmap = HashMap::<String, i32, _, 4, 2, 1>::std();
+
+        let lock = hashmap.try_lock().unwrap();
+
+        lock.insert("1".to_string(), 0);
+        lock.insert("2".to_string(), 1);
+        lock.insert("3".to_string(), 2);
+        lock.insert("4".to_string(), 3);
+
+        println!("{}", hashmap.get(&"1".to_string()).is_some());
+        println!("{}", hashmap.get(&"2".to_string()).is_some());
+        println!("{}", hashmap.get(&"3".to_string()).is_some());
+        println!("{}", hashmap.get(&"4".to_string()).is_some());
     }
 }
