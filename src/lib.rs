@@ -1,102 +1,106 @@
-use crossbeam_epoch::{Atomic, Collector, CompareExchangeError, Guard, LocalHandle, Owned, Shared};
-use std::hash::BuildHasher;
+use crossbeam_epoch::{Atomic, Collector, CompareExchangeError, Guard, Owned, Shared};
+use std::collections::hash_map;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::mem::{align_of, size_of};
 use std::sync::atomic;
 
-const DEFAULT_LENGTH: usize = 1024;
-const DEFAULT_HASHER_CT: usize = 2;
-const DEFAULT_BUCKET_CT: usize = 4;
+const DEFAULT_LENGTH: usize = 4096;
+const DEFAULT_BUCKET_CT: usize = 1;
+
+#[inline]
+fn low_bits<T>() -> usize {
+    (1 << align_of::<T>().trailing_zeros()) - 1
+}
 
 pub type HashMap<
     K,
     V,
-    H = std::collections::hash_map::DefaultHasher,
+    H = hash_map::RandomState,
     const M: usize = DEFAULT_LENGTH,
-    const N: usize = DEFAULT_HASHER_CT,
     const B: usize = DEFAULT_BUCKET_CT,
-> = CuckooHash<K, V, H, M, N, B>;
+> = CuckooHash<K, V, H, M, B>;
 
 #[derive(Debug)]
-pub struct CuckooHash<K, V, H, const M: usize, const N: usize, const B: usize> {
-    hashers: [H; N],
+pub struct CuckooHash<K, V, H, const M: usize, const B: usize> {
+    hash_builders: [H; 2],
     buckets: [[Atomic<Bucket<K, V>>; B]; M],
     collector: Collector,
 }
 
-unsafe impl<K, V, H, const M: usize, const N: usize, const B: usize> Send
-    for CuckooHash<K, V, H, M, N, B>
+unsafe impl<K, V, H, const M: usize, const B: usize> Send for CuckooHash<K, V, H, M, B>
 where
     K: Send,
     V: Send,
 {
 }
 
-unsafe impl<K, V, H, const M: usize, const N: usize, const B: usize> Sync
-    for CuckooHash<K, V, H, M, N, B>
+unsafe impl<K, V, H, const M: usize, const B: usize> Sync for CuckooHash<K, V, H, M, B>
 where
     K: Sync,
     V: Sync,
 {
 }
+
 #[derive(Debug)]
+#[repr(align(8))]
 struct Bucket<K, V> {
     key: K,
     val: V,
 }
 
-impl<K, V, const M: usize, const N: usize, const B: usize>
-    CuckooHash<K, V, std::collections::hash_map::DefaultHasher, M, N, B>
-{
-    // #[cfg(feature = "nightly")]
+impl<K, V, const M: usize, const B: usize> CuckooHash<K, V, hash_map::RandomState, M, B> {
     pub fn std() -> Self {
+        // Ensure `Bucket`s leave enough space to store tag.
+        assert!(align_of::<Bucket<K, V>>() >= 8);
+
         let buckets = [(); M].map(|_| [(); B].map(|_| Atomic::<Bucket<K, V>>::null()));
 
         CuckooHash {
-            hashers: [(); N].map(|_| std::collections::hash_map::RandomState::new().build_hasher()),
+            hash_builders: [
+                std::collections::hash_map::RandomState::new(),
+                std::collections::hash_map::RandomState::new(),
+            ],
             buckets,
             collector: Collector::new(),
         }
     }
 }
 
-impl<K, V, H, const M: usize, const N: usize, const B: usize> CuckooHash<K, V, H, M, N, B>
+impl<K, V, H, const M: usize, const B: usize> CuckooHash<K, V, H, M, B>
 where
-    H: std::hash::Hasher + Clone,
-    K: std::hash::Hash + std::cmp::Eq,
+    H: BuildHasher + Clone,
+    K: Hash + Eq,
     V: Clone,
+    <H as BuildHasher>::Hasher: Hasher,
 {
     pub fn get(&self, k: &K) -> Option<V> {
+        let mut h1 = self.hash_builders[0].build_hasher();
+        let mut h2 = self.hash_builders[1].build_hasher();
+
+        k.hash(&mut h1);
+        k.hash(&mut h2);
+        let first_index = h1.finish() as usize;
+        let tag = h2.finish() as usize & low_bits::<Bucket<K, V>>();
+
+        // XOR the first index with the tag to get the second index and truncate.
+        tag.hash(&mut h1);
+        let second_index = first_index ^ h1.finish() as usize;
+
         let handle = self.collector.register();
+        let guard = handle.pin();
+        guard.flush();
 
-        for hasher in &self.hashers {
-            let mut hasher = hasher.clone();
-            k.hash(&mut hasher);
-            let hash = hasher.finish() as usize;
-            if let Some(val) = self.search_buckets(hash % M, k, &handle) {
-                return Some(val);
-            }
-        }
-        None
-    }
-
-    // Searches a bucket for a key. Rereads when version after read is wrong, yet does not re-read
-    // prior buckets.
-    fn search_buckets<'a>(&'a self, i: usize, k: &K, handle: &LocalHandle) -> Option<V>
-    where
-        V: Clone,
-    {
-        for bucket_ptr in &self.buckets[i] {
-            let guard = handle.pin();
-            guard.flush();
-
-            let bucket = bucket_ptr.load(atomic::Ordering::Relaxed, &guard);
-            unsafe {
-                // If we have an empty bucket, then the key is not in the map.
-                if bucket.is_null() {
-                    return None;
+        for i in [first_index, second_index] {
+            for b in &self.buckets[i % M] {
+                let ptr = b.load(atomic::Ordering::Relaxed, &guard);
+                if ptr.is_null() {
+                    break;
                 }
 
-                if bucket.deref().key.eq(&k) {
-                    return Some(bucket.deref().val.clone());
+                unsafe {
+                    if ptr.tag() & low_bits::<Bucket<K, V>>() == tag && ptr.deref().key.eq(k) {
+                        return Some(ptr.deref().val.clone());
+                    }
                 }
             }
         }
@@ -105,14 +109,30 @@ where
     }
 
     pub fn insert(&self, k: K, v: V) {
+        let mut h1 = self.hash_builders[0].build_hasher();
+        let mut h2 = self.hash_builders[1].build_hasher();
+
+        k.hash(&mut h1);
+        k.hash(&mut h2);
+        let index = h1.finish() as usize;
+        let tag = h2.finish() as usize & low_bits::<Bucket<K, V>>();
+
         let handle = self.collector.register();
         let guard = handle.pin();
-        let new_bucket = Owned::from(Bucket { key: k, val: v }).into_shared(&guard);
+        let new_bucket = Owned::from(Bucket { key: k, val: v })
+            .with_tag(tag)
+            .into_shared(&guard);
 
-        self.insert_internal(new_bucket, &guard, 0);
+        self.insert_internal(index, new_bucket, &guard, 0);
     }
 
-    fn insert_internal(&self, new_bucket: Shared<Bucket<K, V>>, guard: &Guard, depth: usize) {
+    fn insert_internal(
+        &self,
+        index: usize,
+        new_bucket: Shared<Bucket<K, V>>,
+        guard: &Guard,
+        depth: usize,
+    ) {
         // If retry depth is exceeded, defer deallocation of the current bucket and return.
         if depth >= 8 {
             unsafe {
@@ -121,17 +141,11 @@ where
             return;
         }
 
-        for hasher in &self.hashers {
-            let mut hasher = hasher.clone();
-            unsafe {
-                new_bucket.deref().key.hash(&mut hasher);
-            }
-            let hash = hasher.finish() as usize;
-            for bucket in self.buckets[hash % M].iter() {
-                // If an empty bucket is found, we insert here.
-                loop {
-                    // Try inserting expecting a null.
-                    let Err( CompareExchangeError { current, new: _ } ) = bucket.compare_exchange(
+        // Search all the buckets at this index for the tag and then value.
+        for b in &self.buckets[index % M] {
+            loop {
+                // Try inserting expecting a null.
+                let Err( CompareExchangeError { current, new: _ } ) = b.compare_exchange(
                         Shared::null(),
                         new_bucket,
                         atomic::Ordering::Relaxed,
@@ -141,14 +155,16 @@ where
                         return;
                     };
 
-                    unsafe {
-                        if current.deref().key.ne(&new_bucket.deref().key) {
-                            break;
-                        }
+                unsafe {
+                    if current.tag() != new_bucket.tag()
+                        || current.deref().key.ne(&new_bucket.deref().key)
+                    {
+                        break;
                     }
+                }
 
-                    // If keys are equal, try inserting a new value.
-                    let Err( CompareExchangeError { current, new: _ } ) = bucket.compare_exchange(
+                // If keys are equal, try inserting a new value.
+                let Err( CompareExchangeError { current, new: _ } ) = b.compare_exchange(
                         current,
                         new_bucket,
                         atomic::Ordering::Relaxed,
@@ -158,30 +174,32 @@ where
                         return;
                     };
 
-                    unsafe {
-                        if current.deref().key.ne(&new_bucket.deref().key) {
-                            break;
-                        }
+                unsafe {
+                    if current.tag() != new_bucket.tag()
+                        || current.deref().key.ne(&new_bucket.deref().key)
+                    {
+                        break;
                     }
                 }
             }
         }
 
-        // No empty location was found, so we insert it in our first choice bucket and re-insert
-        // the old value.
-        let mut hasher = self.hashers[0].clone();
-        unsafe {
-            new_bucket.deref().key.hash(&mut hasher);
-        }
-        let hash = hasher.finish() as usize;
-        let bucket = &self.buckets[hash % M][B - (depth % B) - 1];
+        // No empty location was found, so we insert depending on recursion depth into this bucket and re-insert
+        // the replaced bucket.
+        let mut h1 = self.hash_builders[0].build_hasher();
+        let bucket = &self.buckets[index % M][B - (depth % B) - 1];
 
         let old = bucket.swap(new_bucket, atomic::Ordering::Relaxed, &guard);
+        let next_tag = old.tag() & low_bits::<Bucket<K, V>>();
 
-        self.insert_internal(old, guard, depth + 1);
+        // XOR the index with the next_tag to get the second index and truncate.
+        next_tag.hash(&mut h1);
+        let next_index = index ^ h1.finish() as usize;
+
+        self.insert_internal(next_index, old, guard, depth + 1);
     }
 
-    pub fn iter(&self) -> Iter<'_, K, V, H, M, N, B> {
+    pub fn iter(&self) -> Iter<'_, K, V, H, M, B> {
         Iter {
             cuckoo: &self,
             index: 0,
@@ -189,17 +207,17 @@ where
     }
 }
 
-pub struct Iter<'c, K, V, H, const M: usize, const N: usize, const B: usize> {
-    cuckoo: &'c CuckooHash<K, V, H, M, N, B>,
+pub struct Iter<'c, K, V, H, const M: usize, const B: usize> {
+    cuckoo: &'c CuckooHash<K, V, H, M, B>,
     index: usize,
 }
 
-impl<'a, K, V, H, const M: usize, const N: usize, const B: usize> Iterator
-    for Iter<'a, K, V, H, M, N, B>
+impl<'a, K, V, H, const M: usize, const B: usize> Iterator for Iter<'a, K, V, H, M, B>
 where
-    H: std::hash::Hasher + Clone,
-    K: std::hash::Hash + std::cmp::Eq,
+    H: BuildHasher + Clone,
+    K: Hash + std::cmp::Eq,
     V: Clone,
+    <H as BuildHasher>::Hasher: Hasher,
 {
     type Item = V;
 
@@ -232,15 +250,15 @@ where
     }
 }
 
-impl<'a, K, V, H, const M: usize, const N: usize, const B: usize> IntoIterator
-    for &'a CuckooHash<K, V, H, M, N, B>
+impl<'a, K, V, H, const M: usize, const B: usize> IntoIterator for &'a CuckooHash<K, V, H, M, B>
 where
-    H: std::hash::Hasher + Clone,
-    K: std::hash::Hash + std::cmp::Eq,
+    H: BuildHasher + Clone,
+    K: Hash + std::cmp::Eq,
     V: Clone,
+    <H as BuildHasher>::Hasher: Hasher,
 {
     type Item = V;
-    type IntoIter = Iter<'a, K, V, H, M, N, B>;
+    type IntoIter = Iter<'a, K, V, H, M, B>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -278,7 +296,7 @@ mod test {
 
     #[test]
     fn stops_retrying_on_max_depth() {
-        let hashmap = HashMap::<String, i32, _, 4, 2, 1>::std();
+        let hashmap = HashMap::<String, i32, _, 4, 1>::std();
 
         hashmap.insert("1".to_string(), 0);
         hashmap.insert("2".to_string(), 1);
@@ -309,7 +327,7 @@ mod test {
     fn test_threads() {
         use std::thread;
 
-        let hashmap = HashMap::<[u8; 12], [u8; 12], _, 64, 2, 2>::std();
+        let hashmap = HashMap::<[u8; 12], [u8; 12], _, 64, 2>::std();
 
         thread::scope(|s| {
             let hashmap = &hashmap;
@@ -323,8 +341,10 @@ mod test {
             }
         });
 
+        /*
         for value in &hashmap {
             println!("{}", String::from_utf8_lossy(&value));
         }
+        */
     }
 }
