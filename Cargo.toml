@@ -1,6 +1,6 @@
 [package]
 name = "seckoo"
-version = "0.0.0-alpha0.2"
+version = "0.0.0-alpha1.0"
 edition = "2021"
 license = "MIT"
 description = "A concurrent Cuckoo Hash Table"
@@ -8,8 +8,7 @@ homepage = "https://docs.rs/seckoo"
 documentation = "https://docs.rs/seckoo"
 repository = "https://github.com/emilHof/seckoo"
 readme = "./README.md"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+authors = ["Emil Hofstetter <emil.k.hofstetter@gmail.com>"]
 
 [dependencies]
 crossbeam-epoch = "0.9.14"

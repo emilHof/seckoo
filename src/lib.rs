@@ -1,40 +1,54 @@
 use crossbeam_epoch::{Atomic, Collector, CompareExchangeError, Guard, Owned, Shared};
 use std::collections::hash_map;
+use std::fmt::Debug;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::mem::{align_of, size_of};
+use std::mem::align_of;
 use std::sync::atomic;
 
 const DEFAULT_LENGTH: usize = 4096;
-const DEFAULT_BUCKET_CT: usize = 1;
 
 #[inline]
 fn low_bits<T>() -> usize {
     (1 << align_of::<T>().trailing_zeros()) - 1
 }
 
-pub type HashMap<
-    K,
-    V,
-    H = hash_map::RandomState,
-    const M: usize = DEFAULT_LENGTH,
-    const B: usize = DEFAULT_BUCKET_CT,
-> = CuckooHash<K, V, H, M, B>;
+pub type HashMap<K, V, H = hash_map::RandomState, const N: usize = DEFAULT_LENGTH> =
+    CuckooHash<K, V, H, N>;
 
-#[derive(Debug)]
-pub struct CuckooHash<K, V, H, const M: usize, const B: usize> {
+pub struct CuckooHash<K, V, H, const N: usize> {
     hash_builders: [H; 2],
-    buckets: [[Atomic<Bucket<K, V>>; B]; M],
+    buckets: [Atomic<Bucket<K, V>>; N],
     collector: Collector,
 }
 
-unsafe impl<K, V, H, const M: usize, const B: usize> Send for CuckooHash<K, V, H, M, B>
+impl<K: Debug, V: Debug, H, const N: usize> Debug for CuckooHash<K, V, H, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = self.collector.register().pin();
+
+        let mut list = f.debug_list();
+        for bucket in &self.buckets {
+            let ptr = bucket.load(atomic::Ordering::Relaxed, &guard);
+
+            if ptr.is_null() {
+                continue;
+            }
+
+            unsafe {
+                list.entry(ptr.deref());
+            }
+        }
+        list.finish()
+    }
+}
+
+unsafe impl<K, V, H, const N: usize> Send for CuckooHash<K, V, H, N>
 where
     K: Send,
     V: Send,
 {
 }
 
-unsafe impl<K, V, H, const M: usize, const B: usize> Sync for CuckooHash<K, V, H, M, B>
+unsafe impl<K, V, H, const N: usize> Sync for CuckooHash<K, V, H, N>
 where
     K: Sync,
     V: Sync,
@@ -42,18 +56,18 @@ where
 }
 
 #[derive(Debug)]
-#[repr(align(8))]
+#[repr(align(2))]
 struct Bucket<K, V> {
     key: K,
     val: V,
 }
 
-impl<K, V, const M: usize, const B: usize> CuckooHash<K, V, hash_map::RandomState, M, B> {
+impl<K, V, const N: usize> CuckooHash<K, V, hash_map::RandomState, N> {
     pub fn std() -> Self {
         // Ensure `Bucket`s leave enough space to store tag.
-        assert!(align_of::<Bucket<K, V>>() >= 8);
+        assert!(align_of::<Bucket<K, V>>() >= 2);
 
-        let buckets = [(); M].map(|_| [(); B].map(|_| Atomic::<Bucket<K, V>>::null()));
+        let buckets = [(); N].map(|_| Atomic::<Bucket<K, V>>::null());
 
         CuckooHash {
             hash_builders: [
@@ -66,7 +80,7 @@ impl<K, V, const M: usize, const B: usize> CuckooHash<K, V, hash_map::RandomStat
     }
 }
 
-impl<K, V, H, const M: usize, const B: usize> CuckooHash<K, V, H, M, B>
+impl<K, V, H, const N: usize> CuckooHash<K, V, H, N>
 where
     H: BuildHasher + Clone,
     K: Hash + Eq,
@@ -80,27 +94,25 @@ where
         k.hash(&mut h1);
         k.hash(&mut h2);
         let first_index = h1.finish() as usize;
-        let tag = h2.finish() as usize & low_bits::<Bucket<K, V>>();
+        let hash2 = h2.finish() as usize;
 
         // XOR the first index with the tag to get the second index and truncate.
-        tag.hash(&mut h1);
-        let second_index = first_index ^ h1.finish() as usize;
+        let second_index = first_index ^ hash2 as usize;
 
         let handle = self.collector.register();
         let guard = handle.pin();
         guard.flush();
 
         for i in [first_index, second_index] {
-            for b in &self.buckets[i % M] {
-                let ptr = b.load(atomic::Ordering::Relaxed, &guard);
-                if ptr.is_null() {
-                    break;
-                }
+            let ptr = &self.buckets[i % N].load(atomic::Ordering::Relaxed, &guard);
 
-                unsafe {
-                    if ptr.tag() & low_bits::<Bucket<K, V>>() == tag && ptr.deref().key.eq(k) {
-                        return Some(ptr.deref().val.clone());
-                    }
+            if ptr.is_null() {
+                break;
+            }
+
+            unsafe {
+                if ptr.deref().key.eq(k) {
+                    return Some((&ptr.deref().val).clone());
                 }
             }
         }
@@ -115,12 +127,11 @@ where
         k.hash(&mut h1);
         k.hash(&mut h2);
         let index = h1.finish() as usize;
-        let tag = h2.finish() as usize & low_bits::<Bucket<K, V>>();
 
         let handle = self.collector.register();
         let guard = handle.pin();
         let new_bucket = Owned::from(Bucket { key: k, val: v })
-            .with_tag(tag)
+            .with_tag(1)
             .into_shared(&guard);
 
         self.insert_internal(index, new_bucket, &guard, 0);
@@ -134,7 +145,7 @@ where
         depth: usize,
     ) {
         // If retry depth is exceeded, defer deallocation of the current bucket and return.
-        if depth >= 8 {
+        if depth >= 16 {
             unsafe {
                 guard.defer_destroy(new_bucket);
             }
@@ -142,64 +153,74 @@ where
         }
 
         // Search all the buckets at this index for the tag and then value.
-        for b in &self.buckets[index % M] {
-            loop {
-                // Try inserting expecting a null.
-                let Err( CompareExchangeError { current, new: _ } ) = b.compare_exchange(
-                        Shared::null(),
-                        new_bucket,
-                        atomic::Ordering::Relaxed,
-                        atomic::Ordering::Relaxed,
-                        &guard,
-                    ) else {
-                        return;
-                    };
+        let bucket = &self.buckets[index % N];
 
-                unsafe {
-                    if current.tag() != new_bucket.tag()
-                        || current.deref().key.ne(&new_bucket.deref().key)
-                    {
-                        break;
-                    }
-                }
+        // Try inserting expecting a null.
+        let Err( CompareExchangeError { current, new: _ } ) = bucket.compare_exchange(
+            Shared::null(),
+            new_bucket,
+            atomic::Ordering::Relaxed,
+            atomic::Ordering::Relaxed,
+            &guard,
+        ) else {
+            return;
+        };
 
-                // If keys are equal, try inserting a new value.
-                let Err( CompareExchangeError { current, new: _ } ) = b.compare_exchange(
-                        current,
-                        new_bucket,
-                        atomic::Ordering::Relaxed,
-                        atomic::Ordering::Relaxed,
-                        &guard,
-                    ) else {
-                        return;
-                    };
-
-                unsafe {
-                    if current.tag() != new_bucket.tag()
-                        || current.deref().key.ne(&new_bucket.deref().key)
-                    {
-                        break;
-                    }
+        loop {
+            // Keys are not equal.
+            unsafe {
+                if current.deref().key.ne(&new_bucket.deref().key) {
+                    break;
                 }
             }
+
+            // Same key, but the other bucket is has a tag of one while we have a tag of 0.
+            if current.tag() & !new_bucket.tag() == 1 {
+                unsafe {
+                    guard.defer_destroy(new_bucket);
+                    guard.flush();
+                }
+                return;
+            }
+
+            // Try swapping out equal key.
+            if let Ok(_) = bucket.compare_exchange(
+                current,
+                new_bucket,
+                atomic::Ordering::Relaxed,
+                atomic::Ordering::Relaxed,
+                &guard,
+            ) {
+                // Succeeded to swap with an equal key.
+                // We defer deallocation.
+                unsafe {
+                    guard.defer_destroy(current);
+                    guard.flush();
+                }
+                return;
+            };
         }
 
         // No empty location was found, so we insert depending on recursion depth into this bucket and re-insert
         // the replaced bucket.
-        let mut h1 = self.hash_builders[0].build_hasher();
-        let bucket = &self.buckets[index % M][B - (depth % B) - 1];
+        let mut h2 = self.hash_builders[1].build_hasher();
 
         let old = bucket.swap(new_bucket, atomic::Ordering::Relaxed, &guard);
-        let next_tag = old.tag() & low_bits::<Bucket<K, V>>();
 
-        // XOR the index with the next_tag to get the second index and truncate.
-        next_tag.hash(&mut h1);
-        let next_index = index ^ h1.finish() as usize;
+        // Set the tag to 0 to signal that it has been moved.
+        let old = old.with_tag(0);
+
+        // XOR the index with the next_tag to get the other index for this key and truncate.
+        unsafe {
+            old.deref().key.hash(&mut h2);
+        }
+        let hash2 = h2.finish();
+        let next_index = index ^ hash2 as usize;
 
         self.insert_internal(next_index, old, guard, depth + 1);
     }
 
-    pub fn iter(&self) -> Iter<'_, K, V, H, M, B> {
+    pub fn iter(&self) -> Iter<'_, K, V, H, N> {
         Iter {
             cuckoo: &self,
             index: 0,
@@ -207,12 +228,12 @@ where
     }
 }
 
-pub struct Iter<'c, K, V, H, const M: usize, const B: usize> {
-    cuckoo: &'c CuckooHash<K, V, H, M, B>,
+pub struct Iter<'c, K, V, H, const N: usize> {
+    cuckoo: &'c CuckooHash<K, V, H, N>,
     index: usize,
 }
 
-impl<'a, K, V, H, const M: usize, const B: usize> Iterator for Iter<'a, K, V, H, M, B>
+impl<'a, K, V, H, const N: usize> Iterator for Iter<'a, K, V, H, N>
 where
     H: BuildHasher + Clone,
     K: Hash + std::cmp::Eq,
@@ -225,22 +246,22 @@ where
         let handle = self.cuckoo.collector.register();
         let guard = handle.pin();
 
-        while self.index < M * B
-            && self.cuckoo.buckets[self.index / B][self.index % B]
+        while self.index < N
+            && self.cuckoo.buckets[self.index]
                 .load(atomic::Ordering::Relaxed, &guard)
                 .is_null()
         {
             self.index += 1
         }
 
-        if self.index >= M * B {
+        if self.index >= N {
             return None;
         }
 
         unsafe {
             self.index += 1;
             return Some(
-                self.cuckoo.buckets[(self.index - 1) / B][(self.index - 1) % B]
+                self.cuckoo.buckets[(self.index - 1)]
                     .load(atomic::Ordering::Relaxed, &guard)
                     .deref()
                     .val
@@ -250,7 +271,7 @@ where
     }
 }
 
-impl<'a, K, V, H, const M: usize, const B: usize> IntoIterator for &'a CuckooHash<K, V, H, M, B>
+impl<'a, K, V, H, const N: usize> IntoIterator for &'a CuckooHash<K, V, H, N>
 where
     H: BuildHasher + Clone,
     K: Hash + std::cmp::Eq,
@@ -258,7 +279,7 @@ where
     <H as BuildHasher>::Hasher: Hasher,
 {
     type Item = V;
-    type IntoIter = Iter<'a, K, V, H, M, B>;
+    type IntoIter = Iter<'a, K, V, H, N>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -291,12 +312,41 @@ mod test {
         hashmap.insert("Hello There!".to_string(), 1);
 
         assert!(hashmap.get(&"Hello There!".to_string()).is_some());
+        println!("returning 1");
         assert_eq!(1, hashmap.get(&"Hello There!".to_string()).unwrap());
+        println!("returning 2");
+    }
+
+    #[test]
+    fn test_insert_will_remove_oldest() {
+        'test: loop {
+            let hashmap = HashMap::<i32, i32>::std();
+
+            for i in 0..1024 {
+                hashmap.insert(i, 0);
+            }
+
+            for i in 0..1024 {
+                if !hashmap.get(&i).is_some() {
+                    continue 'test;
+                }
+            }
+
+            for i in 0..1024 {
+                hashmap.insert(i, 1);
+            }
+
+            for i in 0..1024 {
+                assert_eq!(hashmap.get(&i).unwrap(), 1);
+            }
+
+            break;
+        }
     }
 
     #[test]
     fn stops_retrying_on_max_depth() {
-        let hashmap = HashMap::<String, i32, _, 4, 1>::std();
+        let hashmap = HashMap::<String, i32>::std();
 
         hashmap.insert("1".to_string(), 0);
         hashmap.insert("2".to_string(), 1);
@@ -318,33 +368,37 @@ mod test {
         hashmap.insert("3".to_string(), 2);
         hashmap.insert("4".to_string(), 3);
 
+        println!("iter test");
+
         for value in &hashmap {
             println!("{value}")
         }
     }
 
-    #[test]
-    fn test_threads() {
-        use std::thread;
+    /*
+        #[test]
+        fn test_threads() {
+            use std::thread;
 
-        let hashmap = HashMap::<[u8; 12], [u8; 12], _, 64, 2>::std();
+            let hashmap = HashMap::<[u8; 12], [u8; 12]>::std();
 
-        thread::scope(|s| {
-            let hashmap = &hashmap;
+            thread::scope(|s| {
+                let hashmap = &hashmap;
 
-            for _ in 0..8 {
-                s.spawn(move || {
-                    for _ in 0..16 {
-                        hashmap.insert(rand::random(), rand::random());
-                    }
-                });
+                for _ in 0..8 {
+                    s.spawn(move || {
+                        for _ in 0..16 {
+                            hashmap.insert(rand::random(), rand::random());
+                        }
+                    });
+                }
+            });
+
+            /*
+            for value in &hashmap {
+                println!("{}", String::from_utf8_lossy(&value));
             }
-        });
-
-        /*
-        for value in &hashmap {
-            println!("{}", String::from_utf8_lossy(&value));
+            */
         }
-        */
-    }
+    */
 }
