@@ -145,9 +145,10 @@ where
         depth: usize,
     ) {
         // If retry depth is exceeded, defer deallocation of the current bucket and return.
-        if depth >= 16 {
+        if depth >= 8 {
             unsafe {
                 guard.defer_destroy(new_bucket);
+                guard.flush();
             }
             return;
         }
@@ -156,7 +157,7 @@ where
         let bucket = &self.buckets[index % N];
 
         // Try inserting expecting a null.
-        let Err( CompareExchangeError { current, new: _ } ) = bucket.compare_exchange(
+        let Err( CompareExchangeError { mut current, new: _ } ) = bucket.compare_exchange(
             Shared::null(),
             new_bucket,
             atomic::Ordering::Relaxed,
@@ -167,15 +168,33 @@ where
         };
 
         loop {
+            /*
+            println!("in this loop with index: {}", index % N);
+
+            println!("comparing if equal");
+            */
             // Keys are not equal.
             unsafe {
                 if current.deref().key.ne(&new_bucket.deref().key) {
                     break;
                 }
             }
+            /*
+            println!("are equal!");
+            */
 
+            /*
+            println!(
+                "comparing tags c: {} and n: {}",
+                current.tag(),
+                new_bucket.tag()
+            );
+            */
             // Same key, but the other bucket is has a tag of one while we have a tag of 0.
             if current.tag() & !new_bucket.tag() == 1 {
+                /*
+                println!("existing value is more current!");
+                */
                 unsafe {
                     guard.defer_destroy(new_bucket);
                     guard.flush();
@@ -183,22 +202,35 @@ where
                 return;
             }
 
+            /*
+            println!("trying to swap new value and replace old!");
+            */
+
             // Try swapping out equal key.
-            if let Ok(_) = bucket.compare_exchange(
+            current = match bucket.compare_exchange(
                 current,
                 new_bucket,
                 atomic::Ordering::Relaxed,
                 atomic::Ordering::Relaxed,
                 &guard,
             ) {
-                // Succeeded to swap with an equal key.
-                // We defer deallocation.
-                unsafe {
-                    guard.defer_destroy(current);
-                    guard.flush();
+                Ok(_) => {
+                    /*
+                    println!("success!");
+                    */
+                    // Succeeded to swap with an equal key.
+                    // We defer deallocation.
+                    unsafe {
+                        guard.defer_destroy(current);
+                        guard.flush();
+                    }
+                    return;
                 }
-                return;
-            };
+                Err(CompareExchangeError { current, new: _ }) => current,
+            }
+            /*
+            println!("failed!");
+            */
         }
 
         // No empty location was found, so we insert depending on recursion depth into this bucket and re-insert
@@ -261,7 +293,7 @@ where
         unsafe {
             self.index += 1;
             return Some(
-                self.cuckoo.buckets[(self.index - 1)]
+                self.cuckoo.buckets[self.index - 1]
                     .load(atomic::Ordering::Relaxed, &guard)
                     .deref()
                     .val
@@ -286,8 +318,26 @@ where
     }
 }
 
+impl<K, V, H, const N: usize> Drop for CuckooHash<K, V, H, N> {
+    fn drop(&mut self) {
+        for bucket in &self.buckets {
+            unsafe {
+                let node = bucket.load(atomic::Ordering::Relaxed, crossbeam_epoch::unprotected());
+
+                let Some(node) = node.try_into_owned()  else {
+                    continue;
+                };
+
+                drop(node.into_box())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
+    use std::sync::{atomic::AtomicUsize, Arc};
+
     use super::*;
 
     #[test]
@@ -375,30 +425,83 @@ mod test {
         }
     }
 
-    /*
-        #[test]
-        fn test_threads() {
-            use std::thread;
+    #[test]
+    fn test_threads() {
+        use std::thread;
 
-            let hashmap = HashMap::<[u8; 12], [u8; 12]>::std();
+        let hashmap = HashMap::<[u8; 12], [u8; 12]>::std();
 
-            thread::scope(|s| {
-                let hashmap = &hashmap;
+        thread::scope(|s| {
+            let hashmap = &hashmap;
 
-                for _ in 0..8 {
-                    s.spawn(move || {
-                        for _ in 0..16 {
-                            hashmap.insert(rand::random(), rand::random());
-                        }
-                    });
-                }
-            });
-
-            /*
-            for value in &hashmap {
-                println!("{}", String::from_utf8_lossy(&value));
+            for _ in 0..8 {
+                s.spawn(move || {
+                    for _ in 0..16 {
+                        hashmap.insert(rand::random(), rand::random());
+                    }
+                });
             }
-            */
+        });
+
+        /*
+        for value in &hashmap {
+            println!("{}", String::from_utf8_lossy(&value));
         }
-    */
+        */
+    }
+
+    #[test]
+    fn test_drop() {
+        struct CountOnDrop {
+            key: i32,
+            counter: Arc<AtomicUsize>,
+        }
+
+        impl CountOnDrop {
+            fn new(key: i32, counter: Arc<AtomicUsize>) -> Self {
+                CountOnDrop { key, counter }
+            }
+        }
+
+        impl Hash for CountOnDrop {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.key.hash(state);
+            }
+        }
+
+        impl PartialEq for CountOnDrop {
+            fn eq(&self, other: &Self) -> bool {
+                self.key.eq(&other.key)
+            }
+        }
+
+        impl Eq for CountOnDrop {}
+
+        impl Drop for CountOnDrop {
+            fn drop(&mut self) {
+                println!("Dropping: {}", self.key);
+                self.counter.fetch_add(1, atomic::Ordering::Release);
+            }
+        }
+
+        impl Clone for CountOnDrop {
+            fn clone(&self) -> Self {
+                CountOnDrop {
+                    key: self.key.clone(),
+                    counter: self.counter.clone(),
+                }
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let hashmap = HashMap::<i32, CountOnDrop, _, 4>::std();
+
+        hashmap.insert(0, CountOnDrop::new(0, counter.clone()));
+        hashmap.insert(0, CountOnDrop::new(1, counter.clone()));
+        assert_eq!(hashmap.get(&0).unwrap().key, 1);
+
+        drop(hashmap);
+        assert_eq!(counter.load(atomic::Ordering::Relaxed), 3);
+    }
 }
