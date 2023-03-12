@@ -18,6 +18,22 @@ pub trait Cache: Send + Sync {
     fn get(&self, k: &Self::Key) -> Option<Self::Value>;
 }
 
+impl<T> Cache for &T
+where
+    T: Cache,
+{
+    type Key = T::Key;
+    type Value = T::Value;
+
+    fn get(&self, k: &Self::Key) -> Option<Self::Value> {
+        (*self).get(k)
+    }
+
+    fn insert(&self, k: Self::Key, v: Self::Value) {
+        (*self).insert(k, v)
+    }
+}
+
 impl<K, V, const N: usize> Cache for SeckooCache<K, V, RandomState, N>
 where
     K: Hash + Eq + Send + Sync,
@@ -78,8 +94,53 @@ pub fn insert_get_random<C: Cache<Key = i32, Value = i32> + Send + Sync, F: Fn()
     })
 }
 
-pub fn compare_caches(c: &mut Criterion) {
-    let mut group = c.benchmark_group(format!("Bench Throughput With Variable Threads"));
+pub fn insert_random<C: Cache<Key = i32, Value = i32> + Send + Sync, F: Fn() -> C>(t: usize, f: F) {
+    let cache = f();
+
+    thread::scope(|s| {
+        for _ in 0..t {
+            let cache = &cache;
+            s.spawn(move || {
+                let mut rng = thread_rng();
+
+                for i in 0..black_box(256) {
+                    let num = rng.gen_range(0..4096);
+
+                    cache.insert(black_box(num), i);
+                }
+            });
+        }
+    })
+}
+
+pub fn get_random<C: Cache<Key = i32, Value = i32> + Send + Sync, F: Fn() -> C>(t: usize, f: F) {
+    let cache = f();
+
+    let mut rng = thread_rng();
+
+    for i in 0..black_box(256) {
+        let num = rng.gen_range(0..4096);
+        cache.insert(black_box(num), i);
+    }
+
+    thread::scope(|s| {
+        for _ in 0..t {
+            let cache = &cache;
+            s.spawn(move || {
+                let mut rng = thread_rng();
+
+                for _ in 0..black_box(256) {
+                    let num = rng.gen_range(0..4096);
+
+                    cache.get(&num);
+                }
+            });
+        }
+    })
+}
+
+pub fn compare_insert_get(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("Compare Insert & Get"));
     for t in THREADS {
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("Seckoo {t} Thread(s)")),
@@ -92,7 +153,53 @@ pub fn compare_caches(c: &mut Criterion) {
             |b, &t| b.iter(|| insert_get_random(t, || MokaCache::new(4096))),
         );
     }
+    group.finish();
 }
 
-criterion_group!(benches, compare_caches);
+pub fn compare_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("Compare Insert"));
+    for t in THREADS {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("Seckoo {t} Thread(s)")),
+            &t,
+            |b, &t| b.iter(|| insert_random(t, || SeckooCache::<_, _, _, 8192>::std())),
+        );
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("Moka {t} Thread(s)")),
+            &t,
+            |b, &t| b.iter(|| insert_random(t, || MokaCache::new(8192))),
+        );
+    }
+    group.finish();
+}
+
+pub fn compare_get(c: &mut Criterion) {
+    let seckoo_cache = SeckooCache::<_, _, _, 8192>::std();
+    let moka_cache = MokaCache::new(8192);
+
+    let mut rng = thread_rng();
+
+    for i in 0..black_box(1024) {
+        let num = rng.gen_range(0..4096);
+        seckoo_cache.insert(black_box(num), i);
+        moka_cache.insert(black_box(num), i);
+    }
+
+    let mut group = c.benchmark_group(format!("Compare Insert"));
+    for t in THREADS {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("Seckoo {t} Thread(s)")),
+            &t,
+            |b, &t| b.iter(|| get_random(t, || &seckoo_cache)),
+        );
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("Moka {t} Thread(s)")),
+            &t,
+            |b, &t| b.iter(|| get_random(t, || &moka_cache)),
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, compare_insert_get, compare_insert, compare_get);
 criterion_main!(benches);
