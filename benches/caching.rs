@@ -10,7 +10,7 @@ use rand::{thread_rng, Rng};
 use moka::sync::Cache as MokaCache;
 use seckoo::HashMap as SeckooCache;
 
-const THREADS: [usize; 5] = [1, 2, 4, 8, 16];
+const THREADS: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
 pub trait Cache: Send + Sync {
     type Key;
@@ -171,11 +171,13 @@ pub fn compare_insert_get(c: &mut Criterion) {
             &t,
             |b, &t| b.iter(|| insert_get_random(t, || Mutex::new(HashMap::new()))),
         );
+        /*
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("Moka {t} Thread(s)")),
             &t,
             |b, &t| b.iter(|| insert_get_random(t, || MokaCache::new(8192))),
         );
+        */
     }
     group.finish();
 }
@@ -193,11 +195,13 @@ pub fn compare_insert(c: &mut Criterion) {
             &t,
             |b, &t| b.iter(|| insert_random(t, || Mutex::new(HashMap::new()))),
         );
+        /*
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("Moka {t} Thread(s)")),
             &t,
             |b, &t| b.iter(|| insert_random(t, || MokaCache::new(8192))),
         );
+        */
     }
     group.finish();
 }
@@ -227,11 +231,13 @@ pub fn compare_get(c: &mut Criterion) {
             &t,
             |b, &t| b.iter(|| get_random(t, || &std_mutex)),
         );
+        /*
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("Moka {t} Thread(s)")),
             &t,
             |b, &t| b.iter(|| get_random(t, || &moka_cache)),
         );
+        */
     }
     group.finish();
 }
