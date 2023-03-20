@@ -1,23 +1,42 @@
+#![deny(
+    missing_docs,
+    missing_debug_implementations,
+    missing_copy_implementations,
+    trivial_casts,
+    trivial_numeric_casts,
+    unsafe_code,
+    unstable_features,
+    unused_import_braces,
+    unused_qualifications
+)]
+//! This is a simple lock free cache, implemented via a hash table following a cuckoo hashing
+//! scheme.
 use crossbeam_epoch::{Atomic, Collector, CompareExchangeError, Guard, Owned, Shared};
+use std::alloc::Layout;
 use std::collections::hash_map;
 use std::fmt::Debug;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::mem::align_of;
+use std::mem::{align_of, size_of};
+use std::ops::Deref;
 use std::sync::atomic;
 
 const DEFAULT_LENGTH: usize = 4096;
 
 #[inline]
-fn low_bits<T>() -> usize {
-    (1 << align_of::<T>().trailing_zeros()) - 1
+fn buckets_layout<K, V, const N: usize>() -> Layout {
+    let size = size_of::<[Atomic<Bucket<K, V>>; N]>();
+    let align = align_of::<[Atomic<Bucket<K, V>>; N]>();
+    std::alloc::Layout::from_size_align(size, align).expect("Amount of buckets to not exceed isize")
 }
 
-pub type HashMap<K, V, H = hash_map::RandomState, const N: usize = DEFAULT_LENGTH> =
+/// A lock free cache. Cached values must implement `Clone` in order to be retrieved.
+pub type Cache<K, V, H = hash_map::RandomState, const N: usize = DEFAULT_LENGTH> =
     CuckooHash<K, V, H, N>;
 
+/// A lock free hash table following a cuckoo hashing scheme.
 pub struct CuckooHash<K, V, H, const N: usize> {
     hash_builders: [H; 2],
-    buckets: [Atomic<Bucket<K, V>>; N],
+    buckets: BucketArray<K, V, N>,
     collector: Collector,
 }
 
@@ -26,13 +45,15 @@ impl<K: Debug, V: Debug, H, const N: usize> Debug for CuckooHash<K, V, H, N> {
         let guard = self.collector.register().pin();
 
         let mut list = f.debug_list();
-        for bucket in &self.buckets {
+        for bucket in &*self.buckets {
             let ptr = bucket.load(atomic::Ordering::Relaxed, &guard);
 
             if ptr.is_null() {
                 continue;
             }
 
+            // Safety: While we hold the `Shared` we can safely deref the pointer.
+            #[allow(unsafe_code)]
             unsafe {
                 list.entry(ptr.deref());
             }
@@ -41,6 +62,7 @@ impl<K: Debug, V: Debug, H, const N: usize> Debug for CuckooHash<K, V, H, N> {
     }
 }
 
+#[allow(unsafe_code)]
 unsafe impl<K, V, H, const N: usize> Send for CuckooHash<K, V, H, N>
 where
     K: Send,
@@ -48,6 +70,7 @@ where
 {
 }
 
+#[allow(unsafe_code)]
 unsafe impl<K, V, H, const N: usize> Sync for CuckooHash<K, V, H, N>
 where
     K: Sync,
@@ -62,19 +85,61 @@ struct Bucket<K, V> {
     val: V,
 }
 
+#[derive(Debug)]
+struct BucketArray<K, V, const N: usize> {
+    buckets: *mut [Atomic<Bucket<K, V>>; N],
+}
+
+impl<K, V, const N: usize> BucketArray<K, V, N> {
+    fn new() -> Self {
+        let layout = buckets_layout::<K, V, N>();
+
+        #[allow(unsafe_code)]
+        let buckets = unsafe { std::alloc::alloc_zeroed(layout) };
+
+        Self {
+            buckets: buckets.cast(),
+        }
+    }
+}
+
+impl<K, V, const N: usize> Deref for BucketArray<K, V, N> {
+    type Target = [Atomic<Bucket<K, V>>; N];
+
+    fn deref(&self) -> &Self::Target {
+        // Safety: No one besides us will deallocate the array or alter it in an undefined way.
+        #[allow(unsafe_code)]
+        unsafe {
+            &mut (*self.buckets)
+        }
+    }
+}
+
+impl<K, V, const N: usize> Drop for BucketArray<K, V, N> {
+    fn drop(&mut self) {
+        let layout = buckets_layout::<K, V, N>();
+        // Safety:
+        // 1. We know no one else will have deallocated the buckets before we drop.
+        // 2. After `BucketArray` is dropped the array will no longer be accessed.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::alloc::dealloc(self.buckets.cast(), layout);
+        }
+    }
+}
+
 impl<K, V, const N: usize> CuckooHash<K, V, hash_map::RandomState, N> {
+    /// Create a new `CuckooHash` with the standards library's `RandomState`.
     pub fn std() -> Self {
         // Ensure `Bucket`s leave enough space to store tag.
         assert!(align_of::<Bucket<K, V>>() >= 2);
-
-        let buckets = [(); N].map(|_| Atomic::<Bucket<K, V>>::null());
 
         CuckooHash {
             hash_builders: [
                 std::collections::hash_map::RandomState::new(),
                 std::collections::hash_map::RandomState::new(),
             ],
-            buckets,
+            buckets: BucketArray::new(),
             collector: Collector::new(),
         }
     }
@@ -87,6 +152,7 @@ where
     V: Clone,
     <H as BuildHasher>::Hasher: Hasher,
 {
+    /// Get a clone of the value corresponding to a key, if it exists.
     pub fn get(&self, k: &K) -> Option<V> {
         let mut h1 = self.hash_builders[0].build_hasher();
         let mut h2 = self.hash_builders[1].build_hasher();
@@ -97,7 +163,7 @@ where
         let hash2 = h2.finish() as usize;
 
         // XOR the first index with the tag to get the second index and truncate.
-        let second_index = first_index ^ hash2 as usize;
+        let second_index = first_index ^ hash2;
 
         let handle = self.collector.register();
         let guard = handle.pin();
@@ -110,6 +176,7 @@ where
                 break;
             }
 
+            #[allow(unsafe_code)]
             unsafe {
                 if ptr.deref().key.eq(k) {
                     return Some((&ptr.deref().val).clone());
@@ -120,6 +187,8 @@ where
         None
     }
 
+    /// Insert a new key-value pair into the hash table.
+    #[inline]
     pub fn insert(&self, k: K, v: V) {
         let mut h1 = self.hash_builders[0].build_hasher();
         let mut h2 = self.hash_builders[1].build_hasher();
@@ -146,6 +215,9 @@ where
     ) {
         // If retry depth is exceeded, defer deallocation of the current bucket and return.
         if depth >= 8 {
+            // Safety: This bucket is no longer inserted anywhere in the table, so we can safely
+            // defer deallocation.
+            #[allow(unsafe_code)]
             unsafe {
                 guard.defer_destroy(new_bucket);
                 guard.flush();
@@ -168,43 +240,25 @@ where
         };
 
         loop {
-            /*
-            println!("in this loop with index: {}", index % N);
-
-            println!("comparing if equal");
-            */
             // Keys are not equal.
+            // Safety: We have a valid `Shared` to the bucket, thus we can safely deref.
+            #[allow(unsafe_code)]
             unsafe {
                 if current.deref().key.ne(&new_bucket.deref().key) {
                     break;
                 }
             }
-            /*
-            println!("are equal!");
-            */
-
-            /*
-            println!(
-                "comparing tags c: {} and n: {}",
-                current.tag(),
-                new_bucket.tag()
-            );
-            */
             // Same key, but the other bucket is has a tag of one while we have a tag of 0.
             if current.tag() & !new_bucket.tag() == 1 {
-                /*
-                println!("existing value is more current!");
-                */
+                // Safety: We have not inserted `new_bucket` anywhere, so we can safely defer its
+                // deallocation.
+                #[allow(unsafe_code)]
                 unsafe {
                     guard.defer_destroy(new_bucket);
                     guard.flush();
                 }
                 return;
             }
-
-            /*
-            println!("trying to swap new value and replace old!");
-            */
 
             // Try swapping out equal key.
             current = match bucket.compare_exchange(
@@ -215,11 +269,11 @@ where
                 &guard,
             ) {
                 Ok(_) => {
-                    /*
-                    println!("success!");
-                    */
                     // Succeeded to swap with an equal key.
                     // We defer deallocation.
+                    // Safety: We removed the old bucket from the array and can thus safely defer
+                    // its deallocation.
+                    #[allow(unsafe_code)]
                     unsafe {
                         guard.defer_destroy(current);
                         guard.flush();
@@ -228,9 +282,6 @@ where
                 }
                 Err(CompareExchangeError { current, new: _ }) => current,
             }
-            /*
-            println!("failed!");
-            */
         }
 
         // No empty location was found, so we insert depending on recursion depth into this bucket and re-insert
@@ -243,6 +294,8 @@ where
         let old = old.with_tag(0);
 
         // XOR the index with the next_tag to get the other index for this key and truncate.
+        // Safety: We hold a valid `Shared`.
+        #[allow(unsafe_code)]
         unsafe {
             old.deref().key.hash(&mut h2);
         }
@@ -252,6 +305,7 @@ where
         self.insert_internal(next_index, old, guard, depth + 1);
     }
 
+    /// Returns a cloning iterator over the hash table.
     pub fn iter(&self) -> Iter<'_, K, V, H, N> {
         Iter {
             cuckoo: &self,
@@ -260,6 +314,8 @@ where
     }
 }
 
+/// A cloning iterator over the hash table.
+#[derive(Debug)]
 pub struct Iter<'c, K, V, H, const N: usize> {
     cuckoo: &'c CuckooHash<K, V, H, N>,
     index: usize,
@@ -268,7 +324,7 @@ pub struct Iter<'c, K, V, H, const N: usize> {
 impl<'a, K, V, H, const N: usize> Iterator for Iter<'a, K, V, H, N>
 where
     H: BuildHasher + Clone,
-    K: Hash + std::cmp::Eq,
+    K: Hash + Eq,
     V: Clone,
     <H as BuildHasher>::Hasher: Hasher,
 {
@@ -290,6 +346,9 @@ where
             return None;
         }
 
+        // We get a `Shared` and deref it. This is safe, as we have ensured no threads will
+        // deallocate a `Bucket` that is still in the hash table.
+        #[allow(unsafe_code)]
         unsafe {
             self.index += 1;
             return Some(
@@ -306,7 +365,7 @@ where
 impl<'a, K, V, H, const N: usize> IntoIterator for &'a CuckooHash<K, V, H, N>
 where
     H: BuildHasher + Clone,
-    K: Hash + std::cmp::Eq,
+    K: Hash + Eq,
     V: Clone,
     <H as BuildHasher>::Hasher: Hasher,
 {
@@ -320,7 +379,10 @@ where
 
 impl<K, V, H, const N: usize> Drop for CuckooHash<K, V, H, N> {
     fn drop(&mut self) {
-        for bucket in &self.buckets {
+        for bucket in &*self.buckets {
+            // Safety: We have a mutable reference to the CuckooHash, so we are the only thread
+            // that can currently accessed the pointers.
+            #[allow(unsafe_code)]
             unsafe {
                 let node = bucket.load(atomic::Ordering::Relaxed, crossbeam_epoch::unprotected());
 
@@ -342,12 +404,12 @@ mod test {
 
     #[test]
     fn test_std_constructor() {
-        let _ = HashMap::<i32, i32>::std();
+        let _ = Cache::<i32, i32>::std();
     }
 
     #[test]
     fn test_insert_get() {
-        let hashmap = HashMap::<String, ()>::std();
+        let hashmap = Cache::<String, ()>::std();
 
         hashmap.insert("Hello There!".to_string(), ());
 
@@ -356,7 +418,7 @@ mod test {
 
     #[test]
     fn test_insert_updates_equal_key() {
-        let hashmap = HashMap::<String, i32>::std();
+        let hashmap = Cache::<String, i32>::std();
 
         hashmap.insert("Hello There!".to_string(), 0);
         hashmap.insert("Hello There!".to_string(), 1);
@@ -370,7 +432,7 @@ mod test {
     #[test]
     fn test_insert_will_remove_oldest() {
         'test: loop {
-            let hashmap = HashMap::<i32, i32>::std();
+            let hashmap = Cache::<i32, i32>::std();
 
             for i in 0..1024 {
                 hashmap.insert(i, 0);
@@ -396,7 +458,7 @@ mod test {
 
     #[test]
     fn stops_retrying_on_max_depth() {
-        let hashmap = HashMap::<String, i32>::std();
+        let hashmap = Cache::<String, i32>::std();
 
         hashmap.insert("1".to_string(), 0);
         hashmap.insert("2".to_string(), 1);
@@ -411,7 +473,7 @@ mod test {
 
     #[test]
     fn test_iter() {
-        let hashmap = HashMap::<String, i32>::std();
+        let hashmap = Cache::<String, i32>::std();
 
         hashmap.insert("1".to_string(), 0);
         hashmap.insert("2".to_string(), 1);
@@ -429,7 +491,7 @@ mod test {
     fn test_threads() {
         use std::thread;
 
-        let hashmap = HashMap::<[u8; 12], [u8; 12]>::std();
+        let hashmap = Cache::<[u8; 12], [u8; 12]>::std();
 
         thread::scope(|s| {
             let hashmap = &hashmap;
@@ -442,12 +504,6 @@ mod test {
                 });
             }
         });
-
-        /*
-        for value in &hashmap {
-            println!("{}", String::from_utf8_lossy(&value));
-        }
-        */
     }
 
     #[test]
@@ -495,7 +551,7 @@ mod test {
 
         let counter = Arc::new(AtomicUsize::new(0));
 
-        let hashmap = HashMap::<i32, CountOnDrop, _, 4>::std();
+        let hashmap = Cache::<i32, CountOnDrop, _, 4>::std();
 
         hashmap.insert(0, CountOnDrop::new(0, counter.clone()));
         hashmap.insert(0, CountOnDrop::new(1, counter.clone()));
